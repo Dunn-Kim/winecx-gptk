@@ -1,0 +1,200 @@
+From 158de52a620af2898aa42bd83739db7653c2584e Mon Sep 17 00:00:00 2001
+From: Dong Hwan Kim <karmaddee@gmail.com>
+Date: Mon, 16 Nov 2026 11:58:34 +0900
+Subject: [PATCH] ntdll: expose the stack base at gs:0x8 on macOS, on request.
+
+On macOS, PE code runs with gsbase on the pthread TSD, and only a few TEB
+fields are mirrored there. gs:0x8 is NT_TIB.StackBase on Windows, but in
+the TSD it is the thread's errno pointer. Applications that inline the
+stack base as __readgsqword(0x8) read that pointer instead.
+
+Blink does this for its main thread stack estimate (WTF::GetStackStart and
+GetUnderestimatedStackSize). With the errno pointer as the stack start, the
+estimated stack covers every thread's stack, so every thread is taken for
+the main thread and the renderer dereferences a null pointer at startup.
+Seen with the CEF 74 browser embedded in Mecharashi (ZFGameBrowser.exe,
+zf_cef.dll): its renderer crashed in a loop, while the same build runs on
+upstream Wine 11.0, which gives PE code a gsbase on the TEB.
+
+With WINE_EXPOSE_STACK_BASE=1, remember the errno pointer at thread start
+(amd64_thread_data, TEB+0x350) and:
+
+- the syscall and unix call dispatchers put TEB->Tib.StackBase in the slot
+  on the way back to PE and the errno pointer back when entering unix code;
+- call_user_mode_callback exposes the stack base on entry to PE;
+- init_handler gives macOS its pointer back when a signal arrives.
+
+The errno pointer never changes for a thread, so restoring it is safe
+wherever a signal lands, and nothing is tracked beyond the saved pointer.
+
+Off by default. PE code that calls native code without going through the
+dispatchers would run with the stack base where libsystem expects errno,
+and this has not been tried with D3DMetal. gs:0x10 (StackLimit) is left
+alone, and a fiber switch changes TEB->Tib.StackBase without updating the
+slot until the next return from unix code.
+
+Follows the approach of "ntdll, kernelbase: keep the fiber pointer at
+gs:0x20 on macOS" by Hetthicker (dappermint/winecx-gptk#25), and applies
+on top of it.
+---
+ .../pre-tool-advisory-throttle.json           | 10 +++
+ dlls/ntdll/unix/signal_x86_64.c               | 62 +++++++++++++++++++
+ 2 files changed, 72 insertions(+)
+ create mode 100644 .omc/state/sessions/12ab68a6-713a-46d2-9101-6941ffe07fc0/pre-tool-advisory-throttle.json
+
+diff --git a/.omc/state/sessions/12ab68a6-713a-46d2-9101-6941ffe07fc0/pre-tool-advisory-throttle.json b/.omc/state/sessions/12ab68a6-713a-46d2-9101-6941ffe07fc0/pre-tool-advisory-throttle.json
+new file mode 100644
+index 0000000..3e8f366
+--- /dev/null
++++ b/.omc/state/sessions/12ab68a6-713a-46d2-9101-6941ffe07fc0/pre-tool-advisory-throttle.json
+@@ -0,0 +1,10 @@
++{
++  "version": 1,
++  "entries": {
++    "79a93d4a2f8f50b95f852280616242fee1855dc99a3c75211917f55e72e95fae": {
++      "last_emitted_at_ms": 1794796985488,
++      "message": "Use parallel execution for independent tasks. Use run_in_background for long operations (npm install, builds, tests)."
++    }
++  },
++  "updated_at": "2026-11-16T02:43:05.488Z"
++}
+\ No newline at end of file
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index cbc3488..541978a 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -522,6 +522,7 @@ struct amd64_thread_data
+     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
+     char                  syscall_dispatch; /* 0340 */
+     void                 *pthread_qos;   /* 0348 macOS: unix-side value of the TSD slot under gs:0x20 */
++    void                 *pthread_errno; /* 0350 macOS: unix-side value of the TSD slot under gs:0x8, when exposing StackBase */
+ };
+ 
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
+@@ -532,6 +533,7 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_dispatch ) == 0x340 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pthread_qos ) == 0x348 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pthread_errno ) == 0x350 );
+ 
+ static inline struct amd64_thread_data *amd64_thread_data( struct thread_data *data )
+ {
+@@ -811,6 +813,12 @@ static inline struct thread_data *init_handler( void *sigcontext )
+         !is_inside_syscall( data, RSP_sig((ucontext_t *)sigcontext) ))
+         ((void **)amd64_data->pthread_teb)[4] = amd64_data->pthread_qos;
+ 
++    /* Same for gs:0x8 (see init_syscall_frame): the slot is macOS's errno
++     * pointer, which never changes for a thread, so writing it back is safe
++     * wherever the signal landed, including inside the dispatchers. */
++    if (amd64_data->pthread_errno)
++        ((void **)amd64_data->pthread_teb)[1] = amd64_data->pthread_errno;
++
+     /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
+      * instead of the user selector (cs64_sel: 0x2b, USER64_CS).
+      * Fix up sigcontext so later code can compare it to cs64_sel.
+@@ -1727,6 +1735,12 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
+                    "movq 0x20(%r13),%rax\n\t"  /* NtCurrentTeb()->Tib.FiberData */
+                    "movq %rax,%gs:0x20\n"
+                    "1:\n\t"
++                   /* entering PE: expose TEB->Tib.StackBase at gs:0x8 when the thread opted in */
++                   "cmpq $0,0x350(%r13)\n\t"   /* amd64_thread_data()->pthread_errno */
++                   "jz 1f\n\t"
++                   "movq 0x8(%r13),%rax\n\t"   /* NtCurrentTeb()->Tib.StackBase */
++                   "movq %rax,%gs:0x8\n"
++                   "1:\n\t"
+ #endif
+                    "movq 0x330(%r13),%r10\n\t" /* amd64_thread_data()->instrumentation_callback */
+                    "movq (%r10),%r10\n\t"
+@@ -2933,6 +2947,21 @@ void signal_disable_syscall_dispatch(void)
+ }
+ 
+ #ifdef __APPLE__
++/**********************************************************************
++ *		expose_stack_base
++ */
++static BOOL expose_stack_base(void)
++{
++    static int enabled = -1;
++
++    if (enabled < 0)
++    {
++        const char *env = getenv( "WINE_EXPOSE_STACK_BASE" );
++        enabled = env && atoi( env );
++    }
++    return enabled;
++}
++
+ /**********************************************************************
+  *		mac_thread_gsbase
+  */
+@@ -3112,6 +3141,15 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+     __asm__ volatile ("movq %0,%%gs:%c1" :: "r" ((ULONG64)teb->LastErrorValue),
+                       "n" (FIELD_OFFSET(TEB, LastErrorValue)));
+     thread_data->pthread_teb = mac_thread_gsbase();
++    /* PE code runs with gsbase on the pthread TSD, where gs:0x8 is macOS's errno
++     * pointer rather than NT_TIB.StackBase. Code that inlines the stack base as
++     * __readgsqword(0x8) (Blink's main thread stack estimate, for one) then takes
++     * every thread for the main thread and crashes. With WINE_EXPOSE_STACK_BASE=1,
++     * remember the errno pointer here; the dispatchers put TEB->Tib.StackBase in
++     * the slot while PE code runs and the errno pointer back on the way into unix
++     * code. Off by default: PE code that calls native code without going through
++     * the dispatchers would run with the stack base where libsystem expects errno. */
++    if (expose_stack_base()) thread_data->pthread_errno = ((void **)thread_data->pthread_teb)[1];
+     /* alloc_tls_slot() needs to poke a value to an address relative to each
+        thread's gsbase.  Have each thread record its gsbase pointer into its
+        TEB so alloc_tls_slot() can find it. */
+@@ -3358,6 +3396,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+                    "syscall\n\t"
++                   /* entering unix: give macOS its errno pointer back at gs:0x8 */
++                   "movq 0x350(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_errno */
++                   "testq %rsi,%rsi\n\t"
++                   "jz 7f\n\t"
++                   "movq %rsi,%gs:0x8\n"
++                   "7:\n\t"
+                    /* entering unix: if gs:0x20 holds a fiber pointer, give the macOS QoS slot back its value */
+                    "movq 0x348(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_qos */
+                    "testq %rsi,%rsi\n\t"
+@@ -3413,6 +3457,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "movq 0x20(%r13),%rdx\n\t"      /* NtCurrentTeb()->Tib.FiberData */
+                    "movq %rdx,%gs:0x20\n"
+                    "8:\n\t"
++                   /* leaving unix: expose TEB->Tib.StackBase at gs:0x8 when the thread opted in */
++                   "cmpq $0,0x350(%r13)\n\t"       /* amd64_thread_data()->pthread_errno */
++                   "jz 7f\n\t"
++                   "movq 0x8(%r13),%rdx\n\t"       /* NtCurrentTeb()->Tib.StackBase */
++                   "movq %rdx,%gs:0x8\n"
++                   "7:\n\t"
+ #endif
+                    "leaq 0x70(%rcx),%rsp\n\t"      /* %rsp > frame means no longer inside syscall */
+ #if defined(__linux__) || defined(__FreeBSD__)
+@@ -3696,6 +3746,12 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+                    "syscall\n\t"
++                   /* entering unix: give macOS its errno pointer back at gs:0x8 */
++                   "movq 0x350(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_errno */
++                   "testq %rsi,%rsi\n\t"
++                   "jz 7f\n\t"
++                   "movq %rsi,%gs:0x8\n"
++                   "7:\n\t"
+                    /* entering unix: if gs:0x20 holds a fiber pointer, give the macOS QoS slot back its value */
+                    "movq 0x348(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_qos */
+                    "testq %rsi,%rsi\n\t"
+@@ -3730,6 +3786,12 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "movq 0x20(%r13),%rdx\n\t"      /* NtCurrentTeb()->Tib.FiberData */
+                    "movq %rdx,%gs:0x20\n"
+                    "8:\n\t"
++                   /* leaving unix: expose TEB->Tib.StackBase at gs:0x8 when the thread opted in */
++                   "cmpq $0,0x350(%r13)\n\t"       /* amd64_thread_data()->pthread_errno */
++                   "jz 7f\n\t"
++                   "movq 0x8(%r13),%rdx\n\t"       /* NtCurrentTeb()->Tib.StackBase */
++                   "movq %rdx,%gs:0x8\n"
++                   "7:\n\t"
+ #endif
+                    /* switch to user stack */
+                    "movq 0x88(%rcx),%rsp\n\t"
+-- 
+2.54.0 (Apple Git-157)
+

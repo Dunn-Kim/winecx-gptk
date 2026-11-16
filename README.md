@@ -1,5 +1,9 @@
 # winecx-gptk
 
+> **this fork.** a fork of [frankea/winecx-gptk](https://github.com/frankea/winecx-gptk), which mirrors [dappermint/winecx-gptk](https://github.com/dappermint/winecx-gptk). the recipe, the workflow and everything below are theirs and unchanged. the one addition is [`patches/0002`](patches/0002-ntdll-expose-the-stack-base-at-gs-0x8-on-macOS-on-request.patch), an opt-in (`WINE_EXPOSE_STACK_BASE=1`) that puts the stack base at `gs:0x8` while PE code runs, for programs that read it straight off `%gs`. it follows the fiber patch in `patches/0001` by Hetthicker ([dappermint/winecx-gptk#25](https://github.com/dappermint/winecx-gptk/pull/25)).
+>
+> the patches change wine, so they carry wine's licence, LGPL 2.1 or later; wine itself is the work of the wine authors and codeweavers (see `AUTHORS`, `COPYING.LIB` and `LICENSE` in the [winecx tree](https://github.com/dappermint/winecx)). this repository has no licence file of its own upstream, and this fork does not add one. it publishes no runtime release; builds here are for testing. apple's game porting toolkit is not included.
+
 ci build of a gptk-capable wine runtime for the [frankea/Whisky](https://github.com/frankea/Whisky) fork: codeweavers' crossover 26.3 wine changes, rebased onto upstream wine 11.19.
 
 why: apple's game porting toolkit / d3dmetal payload only executes on crossover-derived wine builds, it patches their unixcall internals at load time. details in [frankea/Whisky#163](https://github.com/frankea/Whisky/issues/163), importer app-side in [frankea/Whisky#164](https://github.com/frankea/Whisky/pull/164).

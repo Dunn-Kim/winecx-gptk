@@ -1,4 +1,4 @@
-From 158de52a620af2898aa42bd83739db7653c2584e Mon Sep 17 00:00:00 2001
+From 54ab352fa2918619000baaefd3c5a83e85fa145e Mon Sep 17 00:00:00 2001
 From: Dong Hwan Kim <karmaddee@gmail.com>
 Date: Mon, 16 Nov 2026 11:58:34 +0900
 Subject: [PATCH] ntdll: expose the stack base at gs:0x8 on macOS, on request.
@@ -37,28 +37,9 @@ Follows the approach of "ntdll, kernelbase: keep the fiber pointer at
 gs:0x20 on macOS" by Hetthicker (dappermint/winecx-gptk#25), and applies
 on top of it.
 ---
- .../pre-tool-advisory-throttle.json           | 10 +++
- dlls/ntdll/unix/signal_x86_64.c               | 62 +++++++++++++++++++
- 2 files changed, 72 insertions(+)
- create mode 100644 .omc/state/sessions/12ab68a6-713a-46d2-9101-6941ffe07fc0/pre-tool-advisory-throttle.json
+ dlls/ntdll/unix/signal_x86_64.c | 62 +++++++++++++++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
 
-diff --git a/.omc/state/sessions/12ab68a6-713a-46d2-9101-6941ffe07fc0/pre-tool-advisory-throttle.json b/.omc/state/sessions/12ab68a6-713a-46d2-9101-6941ffe07fc0/pre-tool-advisory-throttle.json
-new file mode 100644
-index 0000000..3e8f366
---- /dev/null
-+++ b/.omc/state/sessions/12ab68a6-713a-46d2-9101-6941ffe07fc0/pre-tool-advisory-throttle.json
-@@ -0,0 +1,10 @@
-+{
-+  "version": 1,
-+  "entries": {
-+    "79a93d4a2f8f50b95f852280616242fee1855dc99a3c75211917f55e72e95fae": {
-+      "last_emitted_at_ms": 1794796985488,
-+      "message": "Use parallel execution for independent tasks. Use run_in_background for long operations (npm install, builds, tests)."
-+    }
-+  },
-+  "updated_at": "2026-11-16T02:43:05.488Z"
-+}
-\ No newline at end of file
 diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
 index cbc3488..541978a 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c

@@ -1,0 +1,54 @@
+From ceae6729a8f0b33d0434c88f3753b195c58086ad Mon Sep 17 00:00:00 2001
+From: Dong Hwan Kim <karmaddee@gmail.com>
+Date: Tue, 17 Nov 2026 18:34:29 +0900
+Subject: [PATCH] winemac: take the host's application icon before reading the
+ exe's.
+
+set_app_icon read the exe's icon resource first and only then looked at
+WINE_APP_ICON_PATH. For some programs that read never comes back to
+set_app_icon: with Mecharashi (Unity), NtUserDrawIconEx reports "Error
+retrieving icon frame 0" while the icon images are made and nothing after
+create_app_icon_images() runs in that process, although the thread goes on
+to create its windows. Neither the exe's icon nor the host's then reaches
+the Dock, and the application stays on the generic executable icon.
+
+Look at the host's icon first and read the exe's resource only when the
+host named none. A launcher that passes WINE_APP_ICON_PATH gets its icon
+whatever the exe's resource does.
+
+This does not fix the read itself: a program started without
+WINE_APP_ICON_PATH still loses its icon when the read fails.
+---
+ dlls/winemac.drv/window.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 55cec6f..bff2443 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -841,7 +841,7 @@ static BOOL running_image_is(const char *exe_name)
+ 
+ static void set_app_icon(void)
+ {
+-    CFArrayRef images = create_app_icon_images();
++    CFArrayRef images = NULL;
+     CFURLRef icon_url = NULL;
+     const char *icon_path, *owner;
+ 
+@@ -856,6 +856,13 @@ static void set_app_icon(void)
+                                                            strlen(icon_path), FALSE);
+     }
+ 
++    /* The exe's resource is only read when the host named no icon. Reading it
++     * can fail in a way that never comes back here (seen with a Unity game:
++     * NtUserDrawIconEx cannot retrieve a frame, and the rest of this function
++     * does not run), which left the application on the generic icon even with
++     * an icon from the host. */
++    if (!icon_url) images = create_app_icon_images();
++
+     if (images || icon_url)
+     {
+         macdrv_set_application_icon(images, icon_url);
+-- 
+2.54.0 (Apple Git-157)
+

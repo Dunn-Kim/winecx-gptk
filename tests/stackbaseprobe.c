@@ -15,6 +15,7 @@
  * build: x86_64-w64-mingw32-gcc -O2 -o stackbaseprobe.exe stackbaseprobe.c
  * run:   WINE_EXPOSE_STACK_BASE=1 wine stackbaseprobe.exe   (expect 0)
  *        wine stackbaseprobe.exe                            (expect 1)
+ *        copied to ZFGameBrowser.exe, wine ZFGameBrowser.exe (expect 0, patches/0004)
  */
 #include <windows.h>
 #include <stdio.h>

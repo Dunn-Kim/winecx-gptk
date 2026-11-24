@@ -1,0 +1,60 @@
+From afca45c6b3017163bc64f239f7d6ef7980333afa Mon Sep 17 00:00:00 2001
+From: Dong Hwan Kim <karmaddee@gmail.com>
+Date: Tue, 24 Nov 2026 10:48:35 +0900
+Subject: [PATCH] ntdll: expose the stack base to ZFGameBrowser.exe without
+ being asked.
+
+ZFGame Browser (CEF on Chromium 74, Mecharashi's launcher and in-game
+browser) is never started on its own: the game, its launcher or its
+installer starts it. WINE_EXPOSE_STACK_BASE reaches it only through
+whichever of those was started with the variable, so starting the game
+worked while starting the launcher or the installer crashed the
+renderer in a loop again.
+
+Turn the stack base on by default when the process image is
+ZFGameBrowser.exe. The variable still decides when it is set, so
+WINE_EXPOSE_STACK_BASE=0 turns it off for that process too, and every
+other program keeps the old default of off.
+
+The image name is read from the process parameters, which
+init_startup_info fills before the first thread reaches
+init_syscall_frame.
+---
+ dlls/ntdll/unix/signal_x86_64.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 541978a..044feef 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2952,12 +2952,26 @@ void signal_disable_syscall_dispatch(void)
+  */
+ static BOOL expose_stack_base(void)
+ {
++    /* ZFGame Browser (CEF on Chromium 74) crashes its renderer without the stack
++     * base, and it is always started by another program (a game, its launcher or
++     * its installer), so a variable set on one of those does not reach it from
++     * the others. It gets the stack base by default; the variable still wins. */
++    static const WCHAR zfgame_browserW[] = {'Z','F','G','a','m','e','B','r','o','w','s','e','r','.','e','x','e',0};
+     static int enabled = -1;
+ 
+     if (enabled < 0)
+     {
+         const char *env = getenv( "WINE_EXPOSE_STACK_BASE" );
+-        enabled = env && atoi( env );
++
++        if (env) enabled = atoi( env ) != 0;
++        else
++        {
++            const WCHAR *name = peb->ProcessParameters->ImagePathName.Buffer, *p;
++
++            if (name && (p = wcsrchr( name, '/' ))) name = p + 1;
++            if (name && (p = wcsrchr( name, '\\' ))) name = p + 1;
++            enabled = name && !wcsicmp( name, zfgame_browserW );
++        }
+     }
+     return enabled;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

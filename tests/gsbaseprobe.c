@@ -15,18 +15,21 @@
  * its context and resumes it, which reaches the worker as a signal wherever it
  * happens to be.
  *
- * The suspends also show an older problem that 0005 does not change: now and
- * then a worker ends early, with "nested exception on signal stack" at
- * _sigtramp in the log, and GetThreadContext fails. It happens on the engine
- * without 0005 as well, so it is counted and printed but does not fail the run.
+ * The suspends also check patches/0006. Under Rosetta, an access violation
+ * that coincides with a suspend can reach segv_handler with the context of
+ * the suspend signal's entry into _sigtramp; without 0006 the worker is then
+ * aborted ("nested exception on signal stack" in the log), ends early with
+ * its remaining rounds undone, and GetThreadContext on it fails. Every fault
+ * must reach the vectored handler exactly once. GetThreadContext failures are
+ * printed but do not fail the run: an occasional ERROR_ACCESS_DENIED on a live
+ * worker remains with 0006 too, and is a separate problem.
  *
  * Then times, on one thread, QueryPerformanceCounter (one NT syscall per call),
  * gethostname (one ws2_32 unix call per call) and an access violation resumed
  * by a vectored handler (one signal per call).
  *
- * Exit code 0 when gs:0x30 and every open error were right, 1 when any was
- * wrong. Writes to a file because a second wine attached to an existing
- * wineserver has nowhere to print.
+ * Exit code 0 when every check passed, 1 when any failed. Writes to a file
+ * because a second wine attached to an existing wineserver has nowhere to print.
  *
  * build: x86_64-w64-mingw32-gcc -O2 -o gsbaseprobe.exe gsbaseprobe.c -lws2_32
  * run:   wine gsbaseprobe.exe   (expect 0; gsbaseprobe.txt has the timings)
@@ -103,7 +106,8 @@ int main(void)
     CONTEXT ctx;
     WSADATA wsa;
     char host[256];
-    int suspends = 0, context_failures = 0, bad_hostname = 0, n;
+    int suspends = 0, context_failures = 0, bad_hostname = 0, lost = 0, n;
+    DWORD context_error = 0;
 
     out = fopen("gsbaseprobe.txt", "w");
     if (!out) return 2;
@@ -118,23 +122,31 @@ int main(void)
         {
             if (SuspendThread(threads[i]) == (DWORD)-1) continue;
             ctx.ContextFlags = CONTEXT_FULL;
-            if (!GetThreadContext(threads[i], &ctx)) context_failures++;
+            if (!GetThreadContext(threads[i], &ctx))
+            {
+                context_failures++;
+                context_error = GetLastError();
+            }
             ResumeThread(threads[i]);
             suspends++;
         }
         Sleep(1);
     }
-    fprintf(out, "workers: %d x %d rounds, %ld faults, %d suspends, GetThreadContext failed %d\n",
-            WORKERS, ROUNDS, faults, suspends, context_failures);
+    fprintf(out, "workers: %d x %d rounds, %ld faults, %d suspends, GetThreadContext failed %d (last error %lu)\n",
+            WORKERS, ROUNDS, faults, suspends, context_failures, context_error);
     for (int i = 0; i < WORKERS; i++)
     {
         DWORD code = 0;
 
         GetExitCodeThread(threads[i], &code);
         if (done[i] != ROUNDS || code)
+        {
             fprintf(out, "worker %d ended early: %ld of %d rounds, exit code %#lx\n", i, done[i], ROUNDS, code);
+            lost++;
+        }
         CloseHandle(threads[i]);
     }
+    if (faults != WORKERS * ROUNDS) lost++;
 
     QueryPerformanceFrequency(&freq);
 
@@ -163,5 +175,5 @@ int main(void)
     fprintf(out, "wrong gs:0x30: %ld, wrong open error: %ld (last %lu)\n", bad_gs, bad_error, last_error);
     fclose(out);
     WSACleanup();
-    return bad_gs || bad_error || bad_hostname ? 1 : 0;
+    return bad_gs || bad_error || bad_hostname || lost ? 1 : 0;
 }

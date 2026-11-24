@@ -1,0 +1,123 @@
+From c3ec76542614732c836edf18489664e4c970ebd6 Mon Sep 17 00:00:00 2001
+From: Dong Hwan Kim <karmaddee@gmail.com>
+Date: Tue, 24 Nov 2026 11:48:41 +0900
+Subject: [PATCH 7/7] ntdll: read the performance counter without a syscall
+ under Rosetta.
+
+RtlQueryPerformanceCounter always called NtQueryPerformanceCounter, a full
+trip into unix code to read mach_continuous_time. Under Rosetta 2, rdtsc
+counts that same clock in nanoseconds: the x86 timebase is 1/1, and over
+5 million back-to-back reads on an M5 Pro with macOS 27.0.1, rdtsc,
+mach_continuous_time and rdtsc again never came out of order.
+
+When the first process of a session fills KUSER_SHARED_DATA, check that
+the process is translated, that the timebase is 1/1 and that 1000 such
+triples are in order. If so, set QpcBypassEnabled with QpcFrequency at
+1000000000 and QpcShift and QpcBias at 0, which is what the fields mean
+on Windows: rdtsc counts at that frequency. RtlQueryPerformanceCounter
+then divides rdtsc by 100 itself, so QueryPerformanceFrequency stays at
+10 MHz and its values still mix with NtQueryPerformanceCounter's. Intel
+Macs, where rdtsc counts CPU cycles, keep the syscall.
+
+In tests/qpcprobe.c (winecx-gptk), a million calls alternating between
+QueryPerformanceCounter and NtQueryPerformanceCounter never went
+backwards, and a 500 ms Sleep read as 501 to 505 ms. A
+QueryPerformanceCounter call went from about 40 ns to about 9 ns.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/time.c         | 13 +++++++++++
+ dlls/ntdll/unix/virtual.c | 46 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 59 insertions(+)
+
+diff --git a/dlls/ntdll/time.c b/dlls/ntdll/time.c
+index 5a96a1e..68d1bb8 100644
+--- a/dlls/ntdll/time.c
++++ b/dlls/ntdll/time.c
+@@ -381,6 +381,19 @@ LONGLONG WINAPI RtlGetSystemTimePrecise( void )
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter )
+ {
++#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
++    /* only set under Rosetta 2, where rdtsc counts the nanoseconds that
++     * NtQueryPerformanceCounter reads with a syscall (virtual_init_user_shared_data) */
++    if (user_shared_data->QpcBypassEnabled & SHARED_GLOBAL_FLAGS_QPC_BYPASS_ENABLED &&
++        user_shared_data->QpcFrequency == 1000000000)
++    {
++        ULONG lo, hi;
++
++        __asm__ __volatile__( "rdtsc" : "=a" (lo), "=d" (hi) );
++        counter->QuadPart = (((ULONGLONG)hi << 32) | lo) / (1000000000 / TICKSPERSEC);
++        return TRUE;
++    }
++#endif
+     NtQueryPerformanceCounter( counter, NULL );
+     return TRUE;
+ }
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index b6f6a05..63c46c9 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4574,6 +4574,41 @@ void virtual_map_user_shared_data(void)
+ }
+ 
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++#include <mach/mach_time.h>
++
++/******************************************************************
++ *		rdtsc_counts_continuous_time
++ *
++ * Under Rosetta 2, rdtsc counts nanoseconds of mach_continuous_time, the clock
++ * NtQueryPerformanceCounter reads, so PE code can read the performance counter
++ * without a syscall. Check it here rather than assume it, and never on Intel,
++ * where rdtsc counts CPU cycles.
++ */
++static BOOL rdtsc_counts_continuous_time(void)
++{
++    mach_timebase_info_data_t timebase;
++    int translated = 0;
++    size_t size = sizeof(translated);
++
++    if (sysctlbyname( "sysctl.proc_translated", &translated, &size, NULL, 0 ) || !translated) return FALSE;
++    if (mach_timebase_info( &timebase ) || timebase.numer != 1 || timebase.denom != 1) return FALSE;
++    for (int i = 0; i < 1000; i++)
++    {
++        ULONG lo, hi;
++        ULONGLONG before, after, now;
++
++        __asm__ __volatile__( "rdtsc" : "=a" (lo), "=d" (hi) );
++        before = ((ULONGLONG)hi << 32) | lo;
++        now = mach_continuous_time();
++        __asm__ __volatile__( "rdtsc" : "=a" (lo), "=d" (hi) );
++        after = ((ULONGLONG)hi << 32) | lo;
++        if (now < before || after < now || after - before > 1000000) return FALSE;
++    }
++    return TRUE;
++}
++#endif
++
+ /******************************************************************
+  *		virtual_init_user_shared_data
+  *
+@@ -4622,6 +4657,17 @@ void virtual_init_user_shared_data(void)
+     }
+ 
+     init_shared_data_cpuinfo( data );
++#if defined(__APPLE__) && defined(__x86_64__)
++    /* RtlQueryPerformanceCounter then reads rdtsc itself. The fields keep their
++     * Windows meaning: (rdtsc + QpcBias) >> QpcShift counts at QpcFrequency. */
++    if (rdtsc_counts_continuous_time())
++    {
++        data->QpcFrequency     = 1000000000;
++        data->QpcBias          = 0;
++        data->QpcShift         = 0;
++        data->QpcBypassEnabled = SHARED_GLOBAL_FLAGS_QPC_BYPASS_ENABLED;
++    }
++#endif
+     munmap( data, sizeof(*data) );
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

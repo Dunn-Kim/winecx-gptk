@@ -1,0 +1,105 @@
+From 031d7e741f8f62cc8c3dfa1c896ddc1fb1814def Mon Sep 17 00:00:00 2001
+From: Dong Hwan Kim <karmaddee@gmail.com>
+Date: Tue, 24 Nov 2026 11:10:34 +0900
+Subject: [PATCH] ntdll: skip the gsbase syscall on the way into unix code when
+ nothing moved it.
+
+On macOS the syscall and unix call dispatchers called _thread_set_tsd_base
+on every entry, to put gsbase back on the pthread TSD before unix code
+runs. PE code already runs with gsbase on the TSD, though: the only thing
+that moves it to the TEB is leave_handler, when a signal handler returns
+to PE code. Every other entry paid a real syscall to set gsbase to the
+value it already had.
+
+Under Rosetta 2 that syscall is not cheap. On an M5 Pro running macOS 27,
+_thread_set_tsd_base with an unchanged base costs about 161 ns, the same
+as getpid. The rest of the dispatcher's own work is much smaller: about
+14 ns for fxsave64 and fxrstor64, 11 ns for the mxcsr pair, 1 ns for a
+gs-relative load and store.
+
+Have leave_handler set a flag in amd64_thread_data (TEB+0x341) when it
+moves gsbase to the TEB, and have the dispatchers make the syscall only
+when the flag is set, clearing it first. The check runs on the kernel
+stack, where leave_handler never moves gsbase, so a signal that arrives
+after the check cannot leave unix code on the TEB; one that arrives
+before it sets the flag the check then sees. init_handler still sets
+the TSD unconditionally.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/signal_x86_64.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 044feef..727d696 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -521,6 +521,7 @@ struct amd64_thread_data
+     DWORD                 fs;            /* 0338 WOW TEB selector */
+     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
+     char                  syscall_dispatch; /* 0340 */
++    char                  gs_on_teb;     /* 0341 macOS: leave_handler moved gsbase to the TEB */
+     void                 *pthread_qos;   /* 0348 macOS: unix-side value of the TSD slot under gs:0x20 */
+     void                 *pthread_errno; /* 0350 macOS: unix-side value of the TSD slot under gs:0x8, when exposing StackBase */
+ };
+@@ -532,6 +533,7 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, ins
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_dispatch ) == 0x340 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, gs_on_teb ) == 0x341 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pthread_qos ) == 0x348 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pthread_errno ) == 0x350 );
+ 
+@@ -850,7 +852,11 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
+ #elif defined __APPLE__
+     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
+         !is_inside_syscall( data, RSP_sig(sigcontext )))
++    {
++        /* the dispatchers only move gsbase back to the TSD when this is set */
++        amd64_data->gs_on_teb = 1;
+         _thread_set_tsd_base( (uint64_t)data->teb );
++    }
+ #endif
+     if (is_16bit( sigcontext )) return;
+ #ifdef DS_sig
+@@ -3406,10 +3412,17 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "leaq -0x98(%rbp),%rcx\n"
+                    "2:\n\t"
+ #elif defined __APPLE__
++                   /* entering unix: gsbase is already on the pthread TSD unless leave_handler moved it
++                    * to the TEB; _thread_set_tsd_base is a real syscall, so skip it when it would not
++                    * change anything */
++                   "cmpb $0,0x341(%r13)\n\t"       /* amd64_thread_data()->gs_on_teb */
++                   "jz 6f\n\t"
++                   "movb $0,0x341(%r13)\n\t"
+                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+-                   "syscall\n\t"
++                   "syscall\n"
++                   "6:\n\t"
+                    /* entering unix: give macOS its errno pointer back at gs:0x8 */
+                    "movq 0x350(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_errno */
+                    "testq %rsi,%rsi\n\t"
+@@ -3756,10 +3769,17 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "popq %r8\n\t"
+                    "2:\n\t"
+ #elif defined __APPLE__
++                   /* entering unix: gsbase is already on the pthread TSD unless leave_handler moved it
++                    * to the TEB; _thread_set_tsd_base is a real syscall, so skip it when it would not
++                    * change anything */
++                   "cmpb $0,0x341(%r13)\n\t"       /* amd64_thread_data()->gs_on_teb */
++                   "jz 6f\n\t"
++                   "movb $0,0x341(%r13)\n\t"
+                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+-                   "syscall\n\t"
++                   "syscall\n"
++                   "6:\n\t"
+                    /* entering unix: give macOS its errno pointer back at gs:0x8 */
+                    "movq 0x350(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_errno */
+                    "testq %rsi,%rsi\n\t"
+-- 
+2.54.0 (Apple Git-157)
+

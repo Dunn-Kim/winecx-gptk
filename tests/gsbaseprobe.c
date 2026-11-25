@@ -4,14 +4,16 @@
  * patches/0005 stops the dispatchers from calling _thread_set_tsd_base on every
  * entry into unix code. They call it only after leave_handler has put gsbase on
  * the TEB, which happens when a signal handler returns to PE code. If that
- * bookkeeping is wrong, unix code runs with gsbase on the TEB, where libsystem
- * finds TEB->Tib.StackBase instead of its errno pointer, so a failing open()
- * reports the wrong error or crashes.
+ * bookkeeping is wrong, unix code runs with gsbase on the TEB. Run with
+ * WINE_EXPOSE_STACK_BASE=1: the dispatchers then write the errno pointer to
+ * gs:0x8 on every entry into unix code, which with gsbase on the TEB lands on
+ * TEB->Tib.StackBase. Without the variable the probe refuses to run, since
+ * nothing else it checks can see 0005 break.
  *
  * Each worker loops: take an access violation in PE code (a signal, resumed by
- * a vectored handler through NtContinue), check gs:0x30 is still the TEB, then
- * fail to open a file that does not exist and check the error is
- * ERROR_FILE_NOT_FOUND. Meanwhile the main thread suspends each worker, reads
+ * a vectored handler through NtContinue), fail to open a file that does not
+ * exist and check the error is ERROR_FILE_NOT_FOUND, then check
+ * TEB->Tib.StackBase still holds the stack base. Meanwhile the main thread suspends each worker, reads
  * its context and resumes it, which reaches the worker as a signal wherever it
  * happens to be.
  *
@@ -24,7 +26,8 @@
  * printed but do not fail the run: an occasional ERROR_ACCESS_DENIED on a live
  * worker remains with 0006 too, and is a separate problem.
  *
- * Then times, on one thread, QueryPerformanceCounter (one NT syscall per call),
+ * Then times, on one thread, QueryPerformanceCounter (an NT syscall per call
+ * unless patches/0007 reads rdtsc instead),
  * gethostname (one ws2_32 unix call per call) and an access violation resumed
  * by a vectored handler (one signal per call).
  *
@@ -32,17 +35,18 @@
  * because a second wine attached to an existing wineserver has nowhere to print.
  *
  * build: x86_64-w64-mingw32-gcc -O2 -o gsbaseprobe.exe gsbaseprobe.c -lws2_32
- * run:   wine gsbaseprobe.exe   (expect 0; gsbaseprobe.txt has the timings)
+ * run:   WINE_EXPOSE_STACK_BASE=1 wine gsbaseprobe.exe   (expect 0; gsbaseprobe.txt has the timings)
  */
 #include <winsock2.h>
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 #define WORKERS 4
 #define ROUNDS  2000
 
 static FILE *out;
-static volatile LONG faults, bad_gs, bad_error;
+static volatile LONG faults, bad_stack_base, bad_error;
 static volatile LONG done[WORKERS];
 static volatile DWORD last_error;
 
@@ -59,19 +63,11 @@ static void fault(void)
     __asm__ volatile ("xorl %%eax,%%eax\n\tmovl (%%rax),%%eax" ::: "rax", "memory");
 }
 
-static void *gs_teb(void)
-{
-    void *v;
-    __asm__ volatile ("movq %%gs:0x30, %0" : "=r" (v));
-    return v;
-}
-
-static void check_round(void *teb)
+static void check_round(void *stack_base)
 {
     HANDLE file;
 
     fault();
-    if (gs_teb() != teb) InterlockedIncrement(&bad_gs);
     file = CreateFileA("gsbaseprobe-missing.txt", GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
     if (file != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_NOT_FOUND)
@@ -79,16 +75,17 @@ static void check_round(void *teb)
         last_error = GetLastError();
         InterlockedIncrement(&bad_error);
     }
+    if (((NT_TIB *)NtCurrentTeb())->StackBase != stack_base) InterlockedIncrement(&bad_stack_base);
 }
 
 static DWORD WINAPI worker(void *arg)
 {
     int id = (int)(INT_PTR)arg;
-    void *teb = NtCurrentTeb();
+    void *stack_base = ((NT_TIB *)NtCurrentTeb())->StackBase;
 
     for (int i = 0; i < ROUNDS; i++)
     {
-        check_round(teb);
+        check_round(stack_base);
         done[id]++;
     }
     return 0;
@@ -108,9 +105,16 @@ int main(void)
     char host[256];
     int suspends = 0, context_failures = 0, bad_hostname = 0, lost = 0, n;
     DWORD context_error = 0;
+    void *main_stack_base = ((NT_TIB *)NtCurrentTeb())->StackBase;
 
     out = fopen("gsbaseprobe.txt", "w");
     if (!out) return 2;
+    if (!GetEnvironmentVariableA("WINE_EXPOSE_STACK_BASE", host, sizeof(host)) || strcmp(host, "1"))
+    {
+        fprintf(out, "set WINE_EXPOSE_STACK_BASE=1, or 0005 breaking goes unseen\n");
+        fclose(out);
+        return 2;
+    }
     if (!AddVectoredExceptionHandler(1, skip_fault)) return 2;
     if (WSAStartup(MAKEWORD(2, 2), &wsa)) return 2;
 
@@ -170,10 +174,10 @@ int main(void)
     fprintf(out, "access violation:        %7.1f ns\n", per_call_ns(start, end, freq, n));
 
     /* the main thread too, now that it has taken signals of its own */
-    for (int i = 0; i < ROUNDS; i++) check_round(NtCurrentTeb());
+    for (int i = 0; i < ROUNDS; i++) check_round(main_stack_base);
 
-    fprintf(out, "wrong gs:0x30: %ld, wrong open error: %ld (last %lu)\n", bad_gs, bad_error, last_error);
+    fprintf(out, "wrong TEB StackBase: %ld, wrong open error: %ld (last %lu)\n", bad_stack_base, bad_error, last_error);
     fclose(out);
     WSACleanup();
-    return bad_gs || bad_error || bad_hostname || lost ? 1 : 0;
+    return bad_stack_base || bad_error || bad_hostname || lost ? 1 : 0;
 }

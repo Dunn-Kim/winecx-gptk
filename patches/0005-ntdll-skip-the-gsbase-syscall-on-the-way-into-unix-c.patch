@@ -1,4 +1,4 @@
-From 031d7e741f8f62cc8c3dfa1c896ddc1fb1814def Mon Sep 17 00:00:00 2001
+From c1ee7a80133e53abc3dda1e0f4c4f18d38d9b34e Mon Sep 17 00:00:00 2001
 From: Dong Hwan Kim <karmaddee@gmail.com>
 Date: Tue, 24 Nov 2026 11:10:34 +0900
 Subject: [PATCH] ntdll: skip the gsbase syscall on the way into unix code when
@@ -27,11 +27,11 @@ the TSD unconditionally.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- dlls/ntdll/unix/signal_x86_64.c | 24 ++++++++++++++++++++++--
- 1 file changed, 22 insertions(+), 2 deletions(-)
+ dlls/ntdll/unix/signal_x86_64.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
 
 diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
-index 044feef..727d696 100644
+index 044feef..1fa933e 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
 @@ -521,6 +521,7 @@ struct amd64_thread_data
@@ -62,13 +62,11 @@ index 044feef..727d696 100644
  #endif
      if (is_16bit( sigcontext )) return;
  #ifdef DS_sig
-@@ -3406,10 +3412,17 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+@@ -3406,10 +3412,15 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                     "leaq -0x98(%rbp),%rcx\n"
                     "2:\n\t"
  #elif defined __APPLE__
-+                   /* entering unix: gsbase is already on the pthread TSD unless leave_handler moved it
-+                    * to the TEB; _thread_set_tsd_base is a real syscall, so skip it when it would not
-+                    * change anything */
++                   /* entering unix: skip the gsbase syscall unless leave_handler moved it to the TEB */
 +                   "cmpb $0,0x341(%r13)\n\t"       /* amd64_thread_data()->gs_on_teb */
 +                   "jz 6f\n\t"
 +                   "movb $0,0x341(%r13)\n\t"
@@ -81,13 +79,11 @@ index 044feef..727d696 100644
                     /* entering unix: give macOS its errno pointer back at gs:0x8 */
                     "movq 0x350(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_errno */
                     "testq %rsi,%rsi\n\t"
-@@ -3756,10 +3769,17 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+@@ -3756,10 +3767,15 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                     "popq %r8\n\t"
                     "2:\n\t"
  #elif defined __APPLE__
-+                   /* entering unix: gsbase is already on the pthread TSD unless leave_handler moved it
-+                    * to the TEB; _thread_set_tsd_base is a real syscall, so skip it when it would not
-+                    * change anything */
++                   /* entering unix: skip the gsbase syscall unless leave_handler moved it to the TEB */
 +                   "cmpb $0,0x341(%r13)\n\t"       /* amd64_thread_data()->gs_on_teb */
 +                   "jz 6f\n\t"
 +                   "movb $0,0x341(%r13)\n\t"

@@ -3,10 +3,13 @@
  *
  * patches/0007 lets RtlQueryPerformanceCounter read rdtsc itself under Rosetta 2,
  * where rdtsc counts the nanoseconds of mach_continuous_time, the clock that
- * NtQueryPerformanceCounter reads in unix code. KUSER_SHARED_DATA says when:
- * QpcBypassEnabled with QpcFrequency 1000000000. Both must keep 100 ns units.
+ * NtQueryPerformanceCounter reads in unix code. A Wine-private flag says when:
+ * KUSER_SHARED_DATA.Spare, nonzero. Both must keep 100 ns units, and the
+ * Windows fields QpcBypassEnabled and QpcFrequency must stay unset, since they
+ * would claim rdtsc counts at QueryPerformanceFrequency.
  *
- * Checks that the frequency is 10 MHz, that calls alternating between the two
+ * Checks that the flag is set and the Windows fields are not (so run it under
+ * Rosetta 2 only), that the frequency is 10 MHz, that calls alternating between the two
  * never go backwards, and that 500 ms of Sleep reads as about 500 ms. Then times
  * one QueryPerformanceCounter call.
  *
@@ -14,7 +17,7 @@
  * because a second wine attached to an existing wineserver has nowhere to print.
  *
  * build: x86_64-w64-mingw32-gcc -O2 -o qpcprobe.exe qpcprobe.c
- * run:   wine qpcprobe.exe   (expect 0; qpcprobe.txt says whether the bypass is on)
+ * run:   wine qpcprobe.exe   (under Rosetta 2, expect 0)
  */
 #include <windows.h>
 #include <stdio.h>
@@ -25,6 +28,7 @@ int main(void)
 {
     const volatile BYTE *bypass = (const BYTE *)0x7ffe03c6;          /* KUSER_SHARED_DATA.QpcBypassEnabled */
     const volatile LONGLONG *qpc_freq = (const LONGLONG *)0x7ffe0300; /* KUSER_SHARED_DATA.QpcFrequency */
+    const volatile ULONG *rdtsc_flag = (const ULONG *)0x7ffe072c;     /* KUSER_SHARED_DATA.Spare */
     nt_qpc_fn nt_qpc = (nt_qpc_fn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryPerformanceCounter");
     LARGE_INTEGER freq, a, b, start, end;
     ULONGLONG tick0, tick1;
@@ -34,7 +38,9 @@ int main(void)
     FILE *out = fopen("qpcprobe.txt", "w");
 
     if (!out || !nt_qpc) return 2;
-    fprintf(out, "KUSER_SHARED_DATA: QpcBypassEnabled %#x, QpcFrequency %lld\n", *bypass, *qpc_freq);
+    fprintf(out, "KUSER_SHARED_DATA: Spare %lu, QpcBypassEnabled %#x, QpcFrequency %lld\n",
+            *rdtsc_flag, *bypass, *qpc_freq);
+    if (!*rdtsc_flag || *bypass || *qpc_freq) failures++;
 
     QueryPerformanceFrequency(&freq);
     if (freq.QuadPart != 10000000) failures++;

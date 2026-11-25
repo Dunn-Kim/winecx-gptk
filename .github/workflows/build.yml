@@ -1262,6 +1262,27 @@ jobs:
           x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -o flsgetvalue2.exe tests/flsgetvalue2.c
           WINEDEBUG=-all MVK_CONFIG_LOG_LEVEL=0 ./Libraries/Wine/bin/wine64 flsgetvalue2.exe
 
+          # this fork's patches 0002 to 0007 need rosetta, which both runner
+          # lanes are. gsbaseprobe runs three times: without 0006 a worker was
+          # lost in 11 of 18 runs, so a single run misses that regression often.
+          # qpcprobe runs 32-bit too, the only run 0007's i386 path gets.
+          probe() {
+            WINE_EXPOSE_STACK_BASE=1 WINEDEBUG=-all ./Libraries/Wine/bin/wine64 "$1" || {
+              cat "$2"
+              echo "::error::$1 failed"
+              exit 1
+            }
+          }
+          x86_64-w64-mingw32-gcc -O2 -o stackbaseprobe.exe tests/stackbaseprobe.c
+          x86_64-w64-mingw32-gcc -O2 -o gsbaseprobe.exe tests/gsbaseprobe.c -lws2_32
+          x86_64-w64-mingw32-gcc -O2 -o qpcprobe.exe tests/qpcprobe.c
+          i686-w64-mingw32-gcc -O2 -o qpcprobe32.exe tests/qpcprobe.c
+          probe stackbaseprobe.exe stackbaseprobe.txt
+          for i in 1 2 3; do probe gsbaseprobe.exe gsbaseprobe.txt; done
+          probe qpcprobe.exe qpcprobe.txt
+          probe qpcprobe32.exe qpcprobe.txt
+          echo "fork probes: ok"
+
 
           # and media foundation, which is the only way to tell whether the
           # bundled gstreamer plugins were actually found: a wrong plugin path

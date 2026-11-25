@@ -1,8 +1,8 @@
-From 604c276f1863503f5634b3f4f5cb540dccd7e6f6 Mon Sep 17 00:00:00 2001
+From b088816aa89e3646526cadfa2ccb0613327627f2 Mon Sep 17 00:00:00 2001
 From: Dong Hwan Kim <karmaddee@gmail.com>
 Date: Tue, 24 Nov 2026 11:48:41 +0900
-Subject: [PATCH 6/7] ntdll: go back to _sigtramp when Rosetta reports a fault
- with its context.
+Subject: [PATCH] ntdll: go back to _sigtramp when Rosetta reports a fault with
+ its context.
 
 Under Rosetta 2, a fault in PE code that coincides with a pending
 asynchronous signal can reach segv_handler with the wrong context: the
@@ -39,7 +39,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 22 insertions(+)
 
 diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
-index 727d696..8fe5608 100644
+index 1fa933e..64b02f6 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
 @@ -92,6 +92,10 @@ static BOOL is_rosetta2;
